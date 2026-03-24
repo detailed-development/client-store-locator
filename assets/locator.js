@@ -1,0 +1,600 @@
+(function () {
+  const locators = window.CSL_LOCATORS || {};
+  let observerStarted = false;
+  let retryTimer = null;
+  let retryCount = 0;
+  const MAX_RETRIES = 40;
+  const RETRY_DELAY = 500;
+
+  function bootStoreLocators() {
+    if (!document.body || !window.google || !window.google.maps) return;
+
+    Object.keys(locators).forEach((instanceId) => {
+      const root = document.getElementById(instanceId);
+      if (!root || root.dataset.cslInitialized === "1") return;
+
+      const initialized = initStoreLocator(root, locators[instanceId] || {});
+      if (initialized) {
+        root.dataset.cslInitialized = "1";
+      }
+    });
+  }
+
+  function scheduleBootRetries() {
+    if (retryTimer) return;
+
+    retryTimer = window.setInterval(() => {
+      retryCount += 1;
+      bootStoreLocators();
+
+      const remaining = Object.keys(locators).some((instanceId) => {
+        const root = document.getElementById(instanceId);
+        return root && root.dataset.cslInitialized !== "1";
+      });
+
+      if (!remaining || retryCount >= MAX_RETRIES) {
+        window.clearInterval(retryTimer);
+        retryTimer = null;
+      }
+    }, RETRY_DELAY);
+  }
+
+  function startObserver() {
+    if (observerStarted || !window.MutationObserver || !document.body) return;
+    observerStarted = true;
+
+    const observer = new MutationObserver(() => {
+      bootStoreLocators();
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", () => {
+      bootStoreLocators();
+      startObserver();
+      scheduleBootRetries();
+    });
+  } else {
+    bootStoreLocators();
+    startObserver();
+    scheduleBootRetries();
+  }
+
+  window.addEventListener("load", bootStoreLocators);
+
+  window.initStoreLocator = function () {
+    bootStoreLocators();
+    startObserver();
+    scheduleBootRetries();
+  };
+
+  function initStoreLocator(root, config) {
+    if (!window.google || !google.maps) {
+      console.error("Client Store Locator: Google Maps JS API is not loaded.");
+      return false;
+    }
+
+    const state = {
+      root,
+      config,
+      clients: Array.isArray(config.clients) ? config.clients : [],
+      mapEl: root.querySelector(".csl-map"),
+      resultsEl: root.querySelector(".csl-results"),
+      filtersEl: root.querySelector(".csl-filters"),
+      addressEl: root.querySelector(".csl-address"),
+      radiusEl: root.querySelector(".csl-radius"),
+      searchBtn: root.querySelector(".csl-search-btn"),
+      useLocationBtn: root.querySelector(".csl-use-location-btn"),
+      map: null,
+      geocoder: null,
+      placesService: null,
+      infoWindow: null,
+      markers: [],
+      allResults: [],
+      activeFilter: "all",
+    };
+
+    if (!(state.mapEl instanceof HTMLElement)) {
+      return false;
+    }
+
+    state.map = new google.maps.Map(state.mapEl, {
+      center: config.defaultCenter || { lat: 33.4484, lng: -112.0740 },
+      zoom: Number(config.defaultZoom || 12),
+      mapTypeControl: false,
+      streetViewControl: false,
+    });
+
+    state.geocoder = new google.maps.Geocoder();
+    state.placesService = new google.maps.places.PlacesService(state.map);
+    state.infoWindow = new google.maps.InfoWindow();
+
+    if (state.searchBtn) {
+      state.searchBtn.addEventListener("click", () => searchFromAddress(state));
+    }
+
+    if (state.useLocationBtn) {
+      state.useLocationBtn.addEventListener("click", () => useMyLocation(state));
+    }
+
+    if (state.addressEl) {
+      state.addressEl.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          searchFromAddress(state);
+        }
+      });
+    }
+
+    if (config.showFilters && state.filtersEl) {
+      renderFilterButtons(state);
+    }
+
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          nearbySearch(state, { lat: pos.coords.latitude, lng: pos.coords.longitude });
+        },
+        () => {
+          nearbySearch(state, config.defaultCenter || { lat: 33.4484, lng: -112.0740 });
+        },
+        { timeout: 8000 }
+      );
+    } else {
+      nearbySearch(state, config.defaultCenter || { lat: 33.4484, lng: -112.0740 });
+    }
+
+    return true;
+  }
+
+  async function nearbySearch(state, center) {
+    if (!state.resultsEl) return;
+
+    state.resultsEl.innerHTML = `<li>${escapeHtml(state.config.strings.searching || "Searching…")}</li>`;
+    clearMarkers(state);
+
+    const radius = Number((state.radiusEl && state.radiusEl.value) || state.config.defaultRadius || 16093);
+    let allResults = [];
+
+    for (const client of state.clients) {
+      if (client.source_type === "keywords") {
+        const keywordResults = await searchKeywordClient(state, center, radius, client);
+        allResults.push(...keywordResults);
+      } else if (client.source_type === "csv") {
+        const csvResults = await searchCsvClient(state, center, radius, client);
+        allResults.push(...csvResults);
+      }
+    }
+
+    allResults = dedupeResults(allResults);
+    allResults = sortResultsByDistance(center, allResults);
+    state.allResults = allResults;
+
+    renderActiveResults(state, center);
+  }
+
+  function renderActiveResults(state, centerOverride = null) {
+    if (!state.resultsEl || !state.map) return;
+
+    const results = getFilteredResults(state);
+
+    clearMarkers(state);
+
+    if (!results.length) {
+      state.resultsEl.innerHTML = `<li>${escapeHtml(state.config.strings.noResults || "No locations found nearby.")}</li>`;
+
+      if (centerOverride) {
+        state.map.setCenter(centerOverride);
+        state.map.setZoom(Number(state.config.defaultZoom || 12));
+      }
+
+      return;
+    }
+
+    addMarkers(state, results);
+    renderResults(state, results);
+    fitMapToResults(state, results);
+  }
+
+  function getFilteredResults(state) {
+    if (state.activeFilter === "all") {
+      return state.allResults;
+    }
+
+    return state.allResults.filter((item) => item.client_slug === state.activeFilter);
+  }
+
+  function renderFilterButtons(state) {
+    const filtersEl = state.filtersEl;
+    if (!filtersEl) return;
+
+    const items = [{ slug: "all", name: state.config.strings.allStores || "All Stores" }]
+      .concat(state.clients.map((client) => ({ slug: client.slug, name: client.name || client.slug })));
+
+    const uniqueItems = [];
+    const seen = new Set();
+
+    items.forEach((item) => {
+      if (seen.has(item.slug)) return;
+      seen.add(item.slug);
+      uniqueItems.push(item);
+    });
+
+    filtersEl.hidden = uniqueItems.length < 2;
+    filtersEl.innerHTML = uniqueItems.map((item) => `
+      <button type="button" class="csl-filter-btn${item.slug === state.activeFilter ? ' is-active' : ''}" data-filter="${escapeAttribute(item.slug)}">
+        ${escapeHtml(item.name)}
+      </button>
+    `).join("");
+
+    filtersEl.querySelectorAll(".csl-filter-btn").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.activeFilter = button.getAttribute("data-filter") || "all";
+        renderFilterButtons(state);
+        renderActiveResults(state);
+      });
+    });
+  }
+
+  function renderResults(state, results) {
+    if (!state.resultsEl) return;
+
+    state.resultsEl.innerHTML = "";
+
+    results.forEach((item, idx) => {
+      const li = document.createElement("li");
+      const directionsUrl = getDirectionsUrl(item);
+
+      li.innerHTML = `
+        <div class="csl-result-title">
+          <strong>${idx + 1}. ${escapeHtml(item.name || "Store")}</strong>
+          ${item.client_name ? `<span class="csl-client-badge">${escapeHtml(item.client_name)}</span>` : ""}
+        </div>
+        <div class="csl-result-meta">
+          <span class="csl-result-address">${escapeHtml(item.address || "")}</span>
+          <a class="csl-result-directions" href="${directionsUrl}" target="_blank" rel="noopener">${escapeHtml(state.config.strings.directions || "Directions")}</a>
+        </div>
+      `;
+
+      state.resultsEl.appendChild(li);
+    });
+  }
+
+  function addMarkers(state, results) {
+    if (!state.map) return;
+
+    results.forEach((item) => {
+      if (!item.location) return;
+
+      const marker = new google.maps.Marker({
+        map: state.map,
+        position: item.location,
+        title: item.name || "Store",
+      });
+
+      marker.addListener("click", () => {
+        state.infoWindow.setContent(`
+          <div class="csl-iw">
+            <div class="csl-iw__title">${escapeHtml(item.name || "Store")}</div>
+            <div class="csl-iw__addr">${escapeHtml(item.address || "")}</div>
+            <a class="csl-iw__btn" href="${getDirectionsUrl(item)}" target="_blank" rel="noopener">${escapeHtml(state.config.strings.directions || "Directions")}</a>
+          </div>
+        `);
+        state.infoWindow.open(state.map, marker);
+      });
+
+      state.markers.push(marker);
+    });
+  }
+
+  function clearMarkers(state) {
+    state.markers.forEach((marker) => marker.setMap(null));
+    state.markers = [];
+  }
+
+  function fitMapToResults(state, results) {
+    if (!results.length || !state.map) return;
+
+    const bounds = new google.maps.LatLngBounds();
+    let hasBounds = false;
+
+    results.forEach((item) => {
+      if (!item.location) return;
+      bounds.extend(item.location);
+      hasBounds = true;
+    });
+
+    if (hasBounds) {
+      state.map.fitBounds(bounds);
+      if (results.length === 1) {
+        state.map.setZoom(13);
+      }
+    }
+  }
+
+  function searchKeywordClient(state, center, radius, client) {
+    return new Promise((resolve) => {
+      const queries = Array.isArray(client.include_keywords_array) ? client.include_keywords_array : [];
+      const excludes = Array.isArray(client.exclude_terms_array)
+        ? client.exclude_terms_array.map((value) => String(value).trim().toLowerCase())
+        : [];
+
+      if (!queries.length || !state.placesService) {
+        resolve([]);
+        return;
+      }
+
+      const allResults = [];
+      let completed = 0;
+
+      queries.forEach((query) => {
+        state.placesService.textSearch(
+          {
+            query,
+            location: center,
+            radius,
+          },
+          (results, status) => {
+            completed += 1;
+
+            if (status === google.maps.places.PlacesServiceStatus.OK && Array.isArray(results)) {
+              results.forEach((place) => {
+                if (!place.geometry || !place.geometry.location) return;
+
+                const name = (place.name || "").trim();
+                const address = place.formatted_address || place.vicinity || "";
+                const haystack = `${name} ${address}`.toLowerCase();
+                const isExcluded = excludes.some((term) => term && haystack.includes(term));
+                if (isExcluded) return;
+
+                const distance = getDistanceInMeters(center, place.geometry.location);
+                if (distance !== null && radius > 0 && distance > radius) {
+                  return;
+                }
+
+                allResults.push({
+                  client_slug: client.slug || "",
+                  client_name: client.name || "",
+                  source_type: "keywords",
+                  place_id: place.place_id || "",
+                  name,
+                  address,
+                  location: place.geometry.location,
+                });
+              });
+            }
+
+            if (completed === queries.length) {
+              resolve(allResults);
+            }
+          }
+        );
+      });
+    });
+  }
+
+  async function searchCsvClient(state, center, radius, client) {
+    try {
+      const response = await fetch(`${state.config.ajaxUrl}?action=csl_get_csv_locations&client=${encodeURIComponent(client.slug)}`);
+      const payload = await response.json();
+
+      if (!payload.success || !Array.isArray(payload.data)) {
+        return [];
+      }
+
+      const rows = payload.data;
+      const geocoded = [];
+
+      for (const row of rows) {
+        const normalized = await normalizeCsvRowToLocation(state, row, client.slug || "");
+        if (!normalized) continue;
+
+        const distance = getDistanceInMeters(center, normalized.location);
+        if (distance !== null && radius > 0 && distance > radius) {
+          continue;
+        }
+
+        geocoded.push({
+          client_slug: client.slug || "",
+          client_name: client.name || "",
+          source_type: "csv",
+          place_id: "",
+          name: normalized.name,
+          address: normalized.address,
+          phone: normalized.phone || "",
+          url: normalized.url || "",
+          notes: normalized.notes || "",
+          location: normalized.location,
+        });
+      }
+
+      return geocoded;
+    } catch (error) {
+      console.error("Client Store Locator CSV error", error);
+      return [];
+    }
+  }
+
+  async function normalizeCsvRowToLocation(state, row, clientSlug) {
+    const name = row.name || "Store";
+    const address = row.address || "";
+    const phone = row.phone || "";
+    const url = row.url || "";
+    const notes = row.notes || "";
+
+    let location = null;
+
+    if (row.lat !== "" && row.lng !== "") {
+      const lat = Number(row.lat);
+      const lng = Number(row.lng);
+      if (!Number.isNaN(lat) && !Number.isNaN(lng)) {
+        location = new google.maps.LatLng(lat, lng);
+      }
+    }
+
+    if (!location && address) {
+      location = await geocodeAddress(state, address);
+      if (location && clientSlug && row.row_key && row.address_hash) {
+        persistCachedCoords(state, clientSlug, row.row_key, row.address_hash, location);
+      }
+    }
+
+    if (!location) {
+      return null;
+    }
+
+    return { name, address, phone, url, notes, location };
+  }
+
+
+  function persistCachedCoords(state, clientSlug, rowKey, addressHash, location) {
+    const lat = typeof location.lat === "function" ? location.lat() : location.lat;
+    const lng = typeof location.lng === "function" ? location.lng() : location.lng;
+
+    try {
+      const body = new URLSearchParams();
+      body.set("action", "csl_update_row_coords");
+      body.set("client", clientSlug);
+      body.set("row_key", rowKey);
+      body.set("address_hash", addressHash);
+      body.set("lat", String(lat));
+      body.set("lng", String(lng));
+
+      fetch(state.config.ajaxUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" },
+        body: body.toString(),
+        credentials: "same-origin",
+      }).catch(() => {});
+    } catch (error) {
+      console.error("Client Store Locator coordinate cache error", error);
+    }
+  }
+
+  function geocodeAddress(state, address) {
+    return new Promise((resolve) => {
+      if (!state.geocoder) {
+        resolve(null);
+        return;
+      }
+
+      state.geocoder.geocode({ address }, (results, status) => {
+        if (status !== "OK" || !results || !results[0]) {
+          resolve(null);
+          return;
+        }
+        resolve(results[0].geometry.location);
+      });
+    });
+  }
+
+  function dedupeResults(results) {
+    const seen = new Set();
+
+    return results.filter((item) => {
+      const key = makeResultKey(item);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  function makeResultKey(item) {
+    if (item.place_id) {
+      return `place:${item.place_id}`;
+    }
+
+    const lat = item.location && typeof item.location.lat === "function" ? item.location.lat().toFixed(5) : "";
+    const lng = item.location && typeof item.location.lng === "function" ? item.location.lng().toFixed(5) : "";
+    const name = normalizeString(item.name || "");
+    const address = normalizeString(item.address || "");
+
+    return `fallback:${name}|${address}|${lat}|${lng}`;
+  }
+
+  function normalizeString(value) {
+    return String(value).toLowerCase().replace(/\s+/g, " ").trim();
+  }
+
+  function sortResultsByDistance(center, results) {
+    return [...results].sort((a, b) => {
+      const distA = getDistanceInMeters(center, a.location);
+      const distB = getDistanceInMeters(center, b.location);
+      return (distA ?? Number.MAX_SAFE_INTEGER) - (distB ?? Number.MAX_SAFE_INTEGER);
+    });
+  }
+
+  function getDistanceInMeters(center, location) {
+    if (!location) return null;
+    if (!google.maps.geometry || !google.maps.geometry.spherical || typeof google.maps.geometry.spherical.computeDistanceBetween !== "function") {
+      return null;
+    }
+
+    const origin = new google.maps.LatLng(center.lat, center.lng);
+    return google.maps.geometry.spherical.computeDistanceBetween(origin, location);
+  }
+
+  function useMyLocation(state) {
+    if (!navigator.geolocation) {
+      alert(state.config.strings.locationError || "Couldn’t access your location.");
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        nearbySearch(state, { lat: pos.coords.latitude, lng: pos.coords.longitude });
+      },
+      () => {
+        alert(state.config.strings.locationError || "Couldn’t access your location.");
+      }
+    );
+  }
+
+  function searchFromAddress(state) {
+    if (!state.addressEl) {
+      alert(state.config.strings.emptyAddress || "Enter a ZIP code or city/state.");
+      return;
+    }
+
+    const address = (state.addressEl.value || "").trim();
+
+    if (!address) {
+      alert(state.config.strings.emptyAddress || "Enter a ZIP code or city/state.");
+      return;
+    }
+
+    state.geocoder.geocode({ address }, (results, status) => {
+      if (status !== "OK" || !results || !results[0]) {
+        alert(state.config.strings.geocodeError || "Couldn’t find that location.");
+        return;
+      }
+
+      const location = results[0].geometry.location;
+      nearbySearch(state, { lat: location.lat(), lng: location.lng() });
+    });
+  }
+
+  function getDirectionsUrl(item) {
+    if (!item.location) return "#";
+
+    const lat = typeof item.location.lat === "function" ? item.location.lat() : item.location.lat;
+    const lng = typeof item.location.lng === "function" ? item.location.lng() : item.location.lng;
+    return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(`${lat},${lng}`)}`;
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (s) => ({
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      '"': "&quot;",
+      "'": "&#39;",
+    }[s]));
+  }
+
+  function escapeAttribute(str) {
+    return escapeHtml(str).replace(/`/g, "");
+  }
+})();
